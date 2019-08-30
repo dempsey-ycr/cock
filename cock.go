@@ -1,17 +1,46 @@
 package cock
 
 import (
+	"fmt"
 	"html/template"
+	"net"
+	"net/http"
+	"os"
 	"sync"
 )
 
 const defaultMultipartMemory = 32 << 10
+
+var (
+	default404Body   = []byte("404 page not found")
+	default405Body   = []byte("405 method not allowed")
+	defaultAppEngine bool
+)
 
 // HandlerFunc defines the handler used by cock middleware as return value
 type HandlerFunc func(*Context)
 
 // HandlersChain defines a HandlerFunc array
 type HandlersChain []HandlerFunc
+
+// Last returns the last handler in the chain. ie. the last handler is the main own.
+func (c HandlersChain) Last() HandlerFunc {
+	if length := len(c); length > 0 {
+		return c[length-1]
+	}
+	return nil
+}
+
+// RouteInfo represents a request route's specification which contains method and path and its handler.
+type RouteInfo struct {
+	Method      string
+	Path        string
+	Handler     string
+	HandlerFunc HandlerFunc
+}
+
+// RoutesInfo defines a RouteInfo array.
+type RoutesInfo []RouteInfo
 
 // Engine is the framework's instance, it contains the muxer, middleware and configuration settings.
 // create an instance of Engine, by using New() or Default()
@@ -58,14 +87,260 @@ type Engine struct {
 	// Value of 'maxMemory' param that is given to http.Request's ParseMultipartForm method call.
 	MaxMultipartMemory int64
 
-	delims render.Delime
-	HTMLRender render.HTMLRender
-	FuncMap template.FuncMap
+	delims           render.Delime
+	HTMLRender       render.HTMLRender
+	FuncMap          template.FuncMap
 	secureJsonPrefix string
-	allNoRoute HandlersChain
-	allNoMethod HandlersChain
-	noRoute HandlersChain
-	noMethod HandlersChain
-	pool sync.Pool
-	trees methodTrees
+	allNoRoute       HandlersChain
+	allNoMethod      HandlersChain
+	noRoute          HandlersChain
+	noMethod         HandlersChain
+	pool             sync.Pool
+	trees            methodTrees
+}
+
+// New returns a new blank Engine instance without any middleware attached.
+// By default the configuration is:
+// - RedirectTrailingSlash:  true
+// - RedirectFixedPath:		 false
+// - HandleMethodNotAllowed: false
+// - ForwardedByClientIp:	 true
+// - UseRawPath:			 false
+// -UnescapePathValues:		 true
+func New() *Engine {
+	debugPrintWARNINGNew()
+
+	engine := &Engine{
+		RouterGroup: RouterGroup{
+			Handlers: nil,
+			basePath: "/",
+			root:     true,
+		},
+		FuncMap:                template.FuncMap{},
+		RedirectTrailingSlash:  true,
+		RedirectFixedPath:      false,
+		HandleMethodNotAllowed: false,
+		ForwardedByClientIp:    true,
+		AppEngine:              defaultAppEngine,
+		UseRawPath:             false,
+		UnescapePathValues:     true,
+		MaxMultipartMemory:     defaultMultipartMemory,
+		trees:                  make(methodTrees, 0, 9),
+		// delims:                 render.Delims{Left: "{{", Right: "}}"},
+		secureJsonPrefix: "while(1);",
+	}
+	engine.RouterGroup.engine = engine
+	engine.pool.New = func() interface{} {
+		return engine.allocateContext()
+	}
+	return engine
+}
+
+// Default returns an Engine instance with Logger and Recovery middleware already attached.
+func Default() *Engine {
+	debugPrintWARNINGDefault()
+	engine := New()
+	engine.Use(Logger(), Recovery())
+	return engine
+}
+
+func (engine *Engine) allocateContext() *Context {
+	return &Context{engine: engine}
+}
+
+// Delims setws template left and right delims and returns a Engine instance.
+func (engine *Engine) Delims(left, right string) *Engine {
+	engine.delims = render.Delims{Left: left, Right: right}
+	return engine
+}
+
+// SecureJsonPrefix sets the secureJsonPrefix used in Context.SecureJSON.
+func (engine *Engine) SecureJsonPrefix(prefix string) *Engine {
+	engine.secureJsonPrefix = prefix
+	return engine
+}
+
+// LoadHTMLGlob loads HTML files identified by glob pattern
+// and associates the result with HTML renderer.
+func (engine *Engine) LoadHTMLGlob(pattern string) {
+	left := engine.delims.Left
+	right := engine.delims.right
+
+	templ := template.Must(template.New("").Delims(left, right).Funcs(engine.FuncMap).ParseGlob(pattern))
+
+	if IsDebugging() {
+		debugPrintLoadTemplate(templ)
+		engine.HTMLRender = render.HTMLDebug{Glob: pattern, FuncMap: engine.FuncMap, Delims: engine.delims}
+		return
+	}
+	engine.SetHTMLTemplate(templ)
+}
+
+// LoadHTMLFiles loads a slice of HTML files
+// and associates the result with HTML renderer.
+func (engine *Engine) LoadHTMLFiles(files ...string) {
+	if IsDebugging() {
+		engine.HTMLRender = render.HTMLDebug{Files: files, FuncMap: engine.FuncMap, Delims: engine.delims}
+		return
+	}
+
+	templ := template.Must(template.New("").Delims(engine.delims.Left, engine.delims.Right).Funcs(engine.FuncMap).ParseFiles(files...))
+	engine.SetHTMLTemplate(templ)
+}
+
+// SetHTMLTemplate associate a template with HTML renderer.
+func (engine *Engine) SetHTMLTemplate(templ *template.Template) {
+	if len(engine.trees) > 0 {
+		debugPrintWARNINGSetHTMLTemplate()
+	}
+
+	engine.HTMLRender = render.HTMLProduction{Template: templ.Funcs(engine.FuncMap)}
+}
+
+// SetFuncMap sets the FunMap used for template.FuncMap.
+func (engine *Engine) SetFuncMap(funcMap template.FuncMap) {
+	engine.FuncMap = funcMap
+}
+
+// NoRoute adds handlers for NoRoute. It return a 404 code by default.
+func (engine *Engine) NoRoute(handlers ...HandlerFunc) {
+	engine.noRoute = handlers
+	engine.rebuild404Handlers()
+}
+
+// NoMethod sets the handlers called when... TODO.
+func (engine *Engine) NoMethod(handlers ...HandlerFunc) {
+	engine.noMethod = handlers
+	engine.rebuild405Handlers()
+}
+
+// Use attaches a global middleware to the router. ie. the middleware attached though Use() will be
+// included in the handlers chain for every single request. Even 404, 405, static files...
+// For example, this is the right place for a logger or error management middlerware.
+func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
+	engine.RouterGroup.Use(middleware)
+	engine.rebuild404Handlers()
+	engine.rebuild405Handlers()
+	return engine
+}
+
+func (engine *Engine) rebuild404Handlers() {
+	engine.allNoRoute = engine.combineHandlers(engine.noRoute)
+}
+
+func (engine *Engine) rebuild405Handlers() {
+	engine.allNoMethod = engine.combineHandlers(engine.noMethod)
+}
+
+func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+	assert1(path[0] == '/', "path must begin with '/'")
+	assert1(method != "", "HTTP method can not be empty")
+	assert1(len(handlers) > 0, "there must be at least one handler")
+
+	debugPrintRoute(method, path, handlers)
+	root := engine.trees.get(method)
+	if root == nil {
+		root = new(node)
+		root.fullPath = "/"
+		engine.trees = append(engine.trees, methodTrees{method: method, root: root})
+	}
+	root.addRoute(path, handlers)
+}
+
+// Routes returns a slice of registered routes, including some useful information, such as:
+// the http method, path and the handler name.
+func (engine *Engine) Routes() (routes RoutesInfo) {
+	for _, tree := range engine.trees {
+		routes = iterate("", tree.method, routes, tree.root)
+	}
+	return routes
+}
+
+func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
+	path += root.path
+
+	if len(root.handlers) > 0 {
+		handlerFunc := root.handlers.Last()
+		routes = append(routes, RouteInfo{
+			Method:      method,
+			Path:        path,
+			Handler:     nameOfFunction(handlerFunc),
+			HandlerFunc: handlerFunc,
+		})
+	}
+	for _, child := range root.children {
+		routes = iterate(path, method, routes, child)
+	}
+	return routes
+}
+
+// Run attached the router to a http.Server and starts listening and serving HTTP requests.
+// It is a shortcut for http.ListenAndServe(addr, router)
+// Note: this method will block the calling goroutine indefinitely unless an error happens.
+func (engine *Engine) Run(addr ...string) (err error) {
+	defer func() { debugPrintError(err) }()
+	address := resolveAddress(addr)
+	debugPrint("Listening and serving HTTP on %s\n", address)
+	err = http.ListenAndServe(address, engine)
+	return
+}
+
+// RunTLS attached the router to a http.Server and starts listening and serving HTTPS(secure)requests.
+// It is a shortcut for http.ListenAndServeTLS(addr, certFile, keyFile, router)
+// Note: this method will block the calling goroutine indefinetely unless an error happens.
+func (engine *Engine) RunTLS(addr, certFile, keyFile string) (err error) {
+	debugPrint("Listening and serving HTTPS on %s", addr)
+	defer func() { debugPrintError(err) }()
+
+	err = http.ListenAndServeTLS(addr, certFile, keyFile, engine)
+	return
+}
+
+// RunUnix attaches the router to a http.Server and starts listening and serving HTTP requests
+// through the specified unix socket (ie. a file).
+// Note; this method will block the calling goroutine indefinitely unless an error hanppends.
+func (engine *Engine) RunUnix(file string) (err error) {
+	debugPrint("Listening and serving HTTP on unix:/%s", file)
+	defer func() {
+		debugPrintError(err)
+	}()
+
+	os.Remove(file)
+	listener, err := net.Listen("unix", file)
+	if err != nil {
+		return
+	}
+	defer listener.Close()
+	os.Chmod(file, 777)
+	err = http.Serve(listener, engine)
+	return
+}
+
+// RunFd attaches the router to a http.Server and start listening and serving HTTP requests.
+// through the specified file descriptor.
+// Note: this method will block the calling goroutine indefinitely unless an error hanppends.
+func (engine *Engine) RunFd(fd int) (err error) {
+	debugPrint("Listening and serving HTTP on fd@%d", fd)
+	defer func() { debugPrintError(err) }()
+
+	f := os.NewFile(uintptr(fd), fmt.Sprintf("fd@%d", fd))
+	listener, err := net.FileListener(f)
+	if err != nil {
+		return
+	}
+	defer listener.Close()
+	err = http.Serve(listener, engine)
+	return
+}
+
+// ServeHTTP conforms to the http.Handler interface.
+func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	c := engine.pool.Get().(*Context)
+	c.writermem.reset(w)
+	c.Request = req
+	c.reset()
+
+	engine.handleHTTPRequest(c)
+
+	engine.pool.Put(c)
 }
