@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+
+message pb_student {
+    int32 age = 1;
+    string name = 2;
+    string address = 3;
+    double salt = 4;
+    pb_sub sub = 5;
+}
+message pb_sub {
+    // repeated bytes options = 1;
+    bytes options = 1;
+}

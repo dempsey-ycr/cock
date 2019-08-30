@@ -2,10 +2,12 @@ package render
 
 import (
 	"bytes"
-	"encoding/json"
+	//"encoding/json"
+	"fmt"
 	"net/http"
 	"text/template"
 
+	"github.com/dempsey-ycr/cock/internal/json"
 	. "github.com/dempsey-ycr/cock/library/util"
 )
 
@@ -125,4 +127,70 @@ func (r JsonpJSON) Render(w http.ResponseWriter) error {
 	}
 
 	callback := template.JSEscapeString(r.Callback)
+	_, err = w.Write(Stob(callback))
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(Stob("("))
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(ret)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(Stob(")"))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// WriteContentType (JsonpJSON) marshal the given interface object and writes it with custom ContentType.
+func (r JsonpJSON) WriteContentType(w http.ResponseWriter) {
+	writeContentType(w, jsonpContentType)
+}
+
+// Render (AsciiJSON) marshal the given interface object and writes it with custom ContentType.
+func (r AsciiJSON) Render(w http.ResponseWriter) error {
+	r.WriteContentType(w)
+
+	ret, err := json.Marshal(r.Data)
+	if err != nil {
+		return err
+	}
+
+	var buffer bytes.Buffer
+	for _, v := range Btos(ret) {
+		cvt := string(v)
+		if v >= 128 {
+			cvt = fmt.Sprintf("\\u%04x", int64(v))
+		}
+		buffer.WriteString(cvt)
+	}
+
+	_, err = w.Write(buffer.Bytes())
+	return err
+}
+
+// WriteContentType (AsciiJSON) writes JSON ContentType.
+func (r AsciiJSON) WriteContentType(w http.ResponseWriter) {
+	writeContentType(w, jsonAsciiContentType)
+}
+
+// Render (PureJSON) writes custom ContentType and encodes the given interface object.
+func (r PureJSON) Render(w http.ResponseWriter) error {
+	r.WriteContentType(w)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(r.Data)
+}
+
+// WriteContentType (PureJSON) writes custom ContentType.
+func (r PureJSON) WriteContentType(w http.ResponseWriter) {
+	writeContentType(w, jsonContentType)
 }

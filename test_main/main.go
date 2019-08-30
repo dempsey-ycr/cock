@@ -3,6 +3,8 @@ package main
 import (
 	"log"
 	"net/http"
+
+	"github.com/dempsey-ycr/cock/library/util"
 )
 
 type MHander struct {
@@ -19,7 +21,8 @@ func (*MHander) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func Hello(w http.ResponseWriter, r *http.Request) {
-	_, _ =w.Write([]byte("Hello ....."))
+	_, _ = w.Write([]byte("Hello ....."))
+	_ = util.Stob("hello")
 	log.Println("-----------h-------")
 }
 
